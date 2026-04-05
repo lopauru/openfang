@@ -1525,12 +1525,7 @@ impl OpenFangKernel {
     ) -> KernelResult<AgentLoopResult> {
         // Use a scoped lock key so different channels don't block each other
         let lock_key = format!("{agent_id}:{channel_scope}");
-        let lock = self
-            .agent_msg_locks
-            .entry(agent_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        // Use a separate lock map for scoped sessions
+        // Per-channel lock map — different channels run in parallel
         let scoped_lock = {
             static SCOPED_LOCKS: std::sync::OnceLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> = std::sync::OnceLock::new();
             let locks = SCOPED_LOCKS.get_or_init(|| dashmap::DashMap::new());
@@ -1561,22 +1556,15 @@ impl OpenFangKernel {
             }
         };
 
-        // Temporarily swap the agent's session_id to the scoped one
-        let original_session_id = entry.session_id;
-        let _ = self.registry.update_session_id(agent_id, session_id);
-
-        // Execute the LLM agent with the scoped session
+        // Execute the LLM agent with the scoped session (no registry swap needed)
         let handle: Option<Arc<dyn KernelHandle>> = self
             .self_handle
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
         let result = self
-            .execute_llm_agent(&entry, agent_id, message, handle, None, None, None)
+            .execute_llm_agent_with_session(&entry, agent_id, message, handle, None, None, None, Some(session_id))
             .await;
-
-        // Restore the original session_id
-        let _ = self.registry.update_session_id(agent_id, original_session_id);
 
         match result {
             Ok(result) => {
@@ -2372,6 +2360,23 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        self.execute_llm_agent_with_session(entry, agent_id, message, kernel_handle, content_blocks, sender_id, sender_name, None).await
+    }
+
+    /// Execute an LLM agent loop, optionally using a specific session instead of the agent's default.
+    async fn execute_llm_agent_with_session(
+        &self,
+        entry: &AgentEntry,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        session_id_override: Option<openfang_types::agent::SessionId>,
+    ) -> KernelResult<AgentLoopResult> {
+        let effective_session_id = session_id_override.unwrap_or(entry.session_id);
+
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
@@ -2379,10 +2384,10 @@ impl OpenFangKernel {
 
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(effective_session_id)
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: effective_session_id,
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
