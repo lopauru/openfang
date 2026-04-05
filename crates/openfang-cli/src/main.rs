@@ -886,6 +886,10 @@ fn write_stdout_safe(msg: &str) {
 }
 
 fn main() {
+    // Install the rustls crypto provider before any TLS connections are made.
+    // Without this, channels using tokio-tungstenite (Discord, etc.) panic.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Load ~/.openfang/.env into process environment (system env takes priority).
     dotenv::load_dotenv();
 
