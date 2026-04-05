@@ -581,8 +581,8 @@ async fn parse_discord_message(
     let content_text = d["content"].as_str().unwrap_or("");
     let attachments = d["attachments"].as_array();
     tracing::debug!(
-        "Discord parse_message: content={:?}, attachments_count={}, has_embeds={}",
-        &content_text[..content_text.len().min(100)],
+        "Discord parse_message: content_len={}, attachments_count={}, has_embeds={}",
+        content_text.len(),
         attachments.map_or(0, |a| a.len()),
         d["embeds"].as_array().map_or(0, |e| e.len()),
     );
