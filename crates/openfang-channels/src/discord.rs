@@ -122,6 +122,61 @@ impl DiscordAdapter {
         Ok(())
     }
 
+    /// Send a file to a Discord channel by URL (downloads first, then uploads via multipart).
+    async fn api_send_file(
+        &self,
+        channel_id: &str,
+        file_url: &str,
+        caption: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Download the file
+        let resp = self.client.get(file_url).send().await?;
+        let filename = file_url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.split('?').next())
+            .unwrap_or("file.png")
+            .to_string();
+        let bytes = resp.bytes().await?;
+        self.api_send_file_data(channel_id, &bytes, &filename, caption).await
+    }
+
+    /// Send raw file bytes to a Discord channel via multipart upload.
+    async fn api_send_file_data(
+        &self,
+        channel_id: &str,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+
+        let file_part = reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")?;
+
+        let mut form = reqwest::multipart::Form::new().part("files[0]", file_part);
+
+        if let Some(text) = caption {
+            let payload = serde_json::json!({ "content": text });
+            form = form.text("payload_json", payload.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord sendFile failed: {body_text}");
+        }
+        Ok(())
+    }
+
     /// Send typing indicator to a Discord channel.
     async fn api_send_typing(&self, channel_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
@@ -416,6 +471,15 @@ impl ChannelAdapter for DiscordAdapter {
         match content {
             ChannelContent::Text(text) => {
                 self.api_send_message(channel_id, &text).await?;
+            }
+            ChannelContent::Image { url, caption } => {
+                self.api_send_file(channel_id, &url, caption.as_deref()).await?;
+            }
+            ChannelContent::File { url, filename: _ } => {
+                self.api_send_file(channel_id, &url, None).await?;
+            }
+            ChannelContent::FileData { data, filename, mime_type: _ } => {
+                self.api_send_file_data(channel_id, &data, &filename, None).await?;
             }
             _ => {
                 self.api_send_message(channel_id, "(Unsupported content type)")
