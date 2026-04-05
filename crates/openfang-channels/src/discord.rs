@@ -474,7 +474,17 @@ async fn parse_discord_message(
     }
 
     let content_text = d["content"].as_str().unwrap_or("");
-    if content_text.is_empty() {
+    let attachments = d["attachments"].as_array();
+    tracing::debug!(
+        "Discord parse_message: content={:?}, attachments_count={}, has_embeds={}",
+        &content_text[..content_text.len().min(100)],
+        attachments.map_or(0, |a| a.len()),
+        d["embeds"].as_array().map_or(0, |e| e.len()),
+    );
+    let has_attachments = attachments.map_or(false, |a| !a.is_empty());
+
+    // Drop messages that have neither text nor attachments.
+    if content_text.is_empty() && !has_attachments {
         return None;
     }
 
@@ -494,8 +504,31 @@ async fn parse_discord_message(
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now);
 
-    // Parse commands (messages starting with /)
-    let content = if content_text.starts_with('/') {
+    // If the message has attachments, build content from the first attachment.
+    // Text (caption) is appended when present.
+    let content = if has_attachments {
+        let att = &attachments.unwrap()[0];
+        let url = att["url"].as_str().unwrap_or("").to_string();
+        let filename = att["filename"].as_str().unwrap_or("file").to_string();
+        let content_type = att["content_type"].as_str().unwrap_or("");
+        let caption = if content_text.is_empty() {
+            None
+        } else {
+            Some(content_text.to_string())
+        };
+
+        if content_type.starts_with("image/") {
+            ChannelContent::Image { url, caption }
+        } else if content_type.starts_with("audio/") || content_type == "application/ogg" {
+            ChannelContent::Voice {
+                url,
+                duration_seconds: 0,
+            }
+        } else {
+            ChannelContent::File { url, filename }
+        }
+    } else if content_text.starts_with('/') {
+        // Parse commands (messages starting with /)
         let parts: Vec<&str> = content_text.splitn(2, ' ').collect();
         let cmd_name = &parts[0][1..];
         let args = if parts.len() > 1 {
