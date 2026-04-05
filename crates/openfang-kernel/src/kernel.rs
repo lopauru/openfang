@@ -1513,6 +1513,81 @@ impl OpenFangKernel {
             .await
     }
 
+    /// Send a message scoped to a channel-specific session.
+    /// If a session with the given label exists, it is reused; otherwise a new one is created.
+    /// The per-agent lock is keyed by (agent_id, channel_scope) so different channels
+    /// run in parallel while messages within the same channel are serialized.
+    pub async fn send_message_scoped(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        channel_scope: &str,
+    ) -> KernelResult<AgentLoopResult> {
+        // Use a scoped lock key so different channels don't block each other
+        let lock_key = format!("{agent_id}:{channel_scope}");
+        let lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        // Use a separate lock map for scoped sessions
+        let scoped_lock = {
+            static SCOPED_LOCKS: std::sync::OnceLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> = std::sync::OnceLock::new();
+            let locks = SCOPED_LOCKS.get_or_init(|| dashmap::DashMap::new());
+            locks.entry(lock_key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        let _guard = scoped_lock.lock().await;
+
+        // Enforce quota
+        self.scheduler
+            .check_quota(agent_id)
+            .map_err(KernelError::OpenFang)?;
+
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        // Find or create a session for this channel scope
+        let session_id = match self.memory.find_session_by_label(agent_id, channel_scope) {
+            Ok(Some(session)) => {
+                tracing::debug!(agent = %agent_id, scope = channel_scope, "Reusing scoped session");
+                session.id
+            }
+            _ => {
+                tracing::info!(agent = %agent_id, scope = channel_scope, "Creating new scoped session");
+                let session = self.memory.create_session_with_label(agent_id, Some(channel_scope))
+                    .map_err(KernelError::OpenFang)?;
+                session.id
+            }
+        };
+
+        // Temporarily swap the agent's session_id to the scoped one
+        let original_session_id = entry.session_id;
+        let _ = self.registry.update_session_id(agent_id, session_id);
+
+        // Execute the LLM agent with the scoped session
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        let result = self
+            .execute_llm_agent(&entry, agent_id, message, handle, None, None, None)
+            .await;
+
+        // Restore the original session_id
+        let _ = self.registry.update_session_id(agent_id, original_session_id);
+
+        match result {
+            Ok(result) => {
+                self.scheduler.record_usage(agent_id, &result.total_usage);
+                let _ = self.registry.set_state(agent_id, AgentState::Running);
+                Ok(result)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Send a multimodal message (text + images) to an agent and get a response.
     ///
     /// Used by channel bridges when a user sends a photo — the image is downloaded,

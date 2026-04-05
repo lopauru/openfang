@@ -6,8 +6,8 @@
 use crate::formatter;
 use crate::router::AgentRouter;
 use crate::types::{
-    default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
-    LifecycleReaction,
+    default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType,
+    ChannelUser, LifecycleReaction,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -100,6 +100,19 @@ fn format_channel_help() -> String {
 pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
+
+    /// Send a message scoped to a specific channel session.
+    /// The channel_scope (e.g. "discord:123456", "whatsapp:+598...") determines
+    /// which session to use. Each unique scope gets its own independent session.
+    async fn send_message_scoped(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        _channel_scope: &str,
+    ) -> Result<String, String> {
+        // Default: ignore scope, use global session
+        self.send_message(agent_id, message).await
+    }
 
     /// Send a message with structured content blocks (text + images) to an agent.
     ///
@@ -964,8 +977,29 @@ async fn dispatch_message(
         text.clone()
     };
 
-    // Send to agent and relay response
-    let result = handle.send_message(agent_id, &prefixed_text).await;
+    // Build a channel scope for per-channel sessions.
+    // Format: "channel_type:platform_id" (e.g. "discord:123456", "whatsapp:+598...")
+    let channel_scope = {
+        let ct = match &message.channel {
+            ChannelType::Discord => if message.is_group { "discord" } else { "discord-dm" },
+            ChannelType::Telegram => if message.is_group { "telegram" } else { "telegram-dm" },
+            ChannelType::WhatsApp => "whatsapp",
+            ChannelType::Slack => "slack",
+            _ => "other",
+        };
+        // For groups use the channel/group ID; for DMs use the sender's ID
+        let scope_id = if message.is_group {
+            message.metadata.get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&message.sender.platform_id)
+        } else {
+            &message.sender.platform_id
+        };
+        format!("{ct}:{scope_id}")
+    };
+
+    // Send to agent using a channel-scoped session
+    let result = handle.send_message_scoped(agent_id, &prefixed_text, &channel_scope).await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();

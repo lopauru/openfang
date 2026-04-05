@@ -249,6 +249,7 @@ impl ChannelAdapter for DiscordAdapter {
                 };
 
                 backoff = INITIAL_BACKOFF;
+                let connected_at = std::time::Instant::now();
                 info!("Discord gateway connected");
 
                 let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -461,8 +462,18 @@ impl ChannelAdapter for DiscordAdapter {
                     }
                 };
 
-                if !should_reconnect || *shutdown.borrow() {
+                if *shutdown.borrow() {
                     break;
+                }
+
+                // Always reconnect unless shutdown was requested.
+                // Discord gateways close connections periodically for load balancing;
+                // this is expected and not a reason to stop.
+                if !should_reconnect {
+                    // Unexpected disconnect — clear session so we do a fresh IDENTIFY
+                    warn!("Discord: unexpected disconnect, clearing session for fresh IDENTIFY");
+                    *session_id_store.write().await = None;
+                    *sequence.write().await = None;
                 }
 
                 // Try resume URL if available
@@ -470,9 +481,18 @@ impl ChannelAdapter for DiscordAdapter {
                     connect_url = format!("{url}/?v=10&encoding=json");
                 }
 
+                // Reset backoff if we were connected long enough (>30s) — indicates
+                // a healthy connection that was closed for normal reasons (load balancing).
+                // Only grow backoff for rapid successive failures.
+                if connected_at.elapsed() > Duration::from_secs(30) {
+                    backoff = INITIAL_BACKOFF;
+                }
+
                 warn!("Discord: reconnecting in {backoff:?}");
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                if connected_at.elapsed() <= Duration::from_secs(30) {
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
             }
 
             info!("Discord gateway loop stopped");
@@ -651,6 +671,7 @@ async fn parse_discord_message(
     if was_mentioned {
         metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
     }
+    metadata.insert("channel_id".to_string(), serde_json::json!(channel_id));
 
     Some(ChannelMessage {
         channel: ChannelType::Discord,
