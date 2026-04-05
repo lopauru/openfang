@@ -1151,6 +1151,7 @@ pub async fn start_channel_bridge_with_config(
                 token,
                 dc_config.allowed_guilds.clone(),
                 dc_config.allowed_users.clone(),
+                dc_config.exclude_channels.clone(),
                 dc_config.ignore_bots,
                 dc_config.intents,
             ));

@@ -1779,6 +1779,10 @@ pub struct DiscordConfig {
     /// Default channel ID for outgoing messages when no recipient is specified.
     #[serde(default)]
     pub default_channel_id: Option<String>,
+    /// Channel IDs to exclude from group_policy=all (messages in these channels
+    /// require @mention regardless of group_policy).
+    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
+    pub exclude_channels: Vec<String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1794,6 +1798,7 @@ impl Default for DiscordConfig {
             intents: 37376,
             ignore_bots: true,
             default_channel_id: None,
+            exclude_channels: vec![],
             overrides: ChannelOverrides::default(),
         }
     }

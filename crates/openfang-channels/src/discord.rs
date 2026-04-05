@@ -40,6 +40,8 @@ pub struct DiscordAdapter {
     client: reqwest::Client,
     allowed_guilds: Vec<String>,
     allowed_users: Vec<String>,
+    /// Channel IDs excluded from group_policy=all (require @mention).
+    exclude_channels: Vec<String>,
     ignore_bots: bool,
     intents: u64,
     shutdown_tx: Arc<watch::Sender<bool>>,
@@ -57,6 +59,7 @@ impl DiscordAdapter {
         token: String,
         allowed_guilds: Vec<String>,
         allowed_users: Vec<String>,
+        exclude_channels: Vec<String>,
         ignore_bots: bool,
         intents: u64,
     ) -> Self {
@@ -66,6 +69,7 @@ impl DiscordAdapter {
             client: reqwest::Client::new(),
             allowed_guilds,
             allowed_users,
+            exclude_channels,
             ignore_bots,
             intents,
             shutdown_tx: Arc::new(shutdown_tx),
@@ -213,6 +217,7 @@ impl ChannelAdapter for DiscordAdapter {
         let intents = self.intents;
         let allowed_guilds = self.allowed_guilds.clone();
         let allowed_users = self.allowed_users.clone();
+        let exclude_channels = self.exclude_channels.clone();
         let ignore_bots = self.ignore_bots;
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
@@ -382,6 +387,22 @@ impl ChannelAdapter for DiscordAdapter {
                                     )
                                     .await
                                     {
+                                        // If message is in an excluded channel and bot was not
+                                        // @mentioned, skip it (require mention in excluded channels).
+                                        let msg_channel_id = d["channel_id"].as_str().unwrap_or("");
+                                        if !exclude_channels.is_empty()
+                                            && exclude_channels.iter().any(|c| c == msg_channel_id)
+                                            && msg.is_group
+                                        {
+                                            let was_mentioned = msg.metadata.get("was_mentioned")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            if !was_mentioned {
+                                                debug!("Discord: skipping message in excluded channel {msg_channel_id}");
+                                                continue;
+                                            }
+                                        }
+
                                         debug!(
                                             "Discord {event_name} from {}: {:?}",
                                             msg.sender.display_name, msg.content
@@ -991,6 +1012,7 @@ mod tests {
         let adapter = DiscordAdapter::new(
             "test-token".to_string(),
             vec!["123".to_string(), "456".to_string()],
+            vec![],
             vec![],
             true,
             37376,
