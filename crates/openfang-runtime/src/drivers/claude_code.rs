@@ -130,6 +130,7 @@ impl ClaudeCodeDriver {
     }
 
     /// Build a text prompt from the completion request messages.
+    /// Images are saved to temp files and referenced via Read-tool instructions.
     fn build_prompt(request: &CompletionRequest) -> String {
         let mut parts = Vec::new();
 
@@ -139,9 +140,57 @@ impl ClaudeCodeDriver {
                 Role::Assistant => "Assistant",
                 Role::System => "System",
             };
-            let text = msg.content.text_content();
-            if !text.is_empty() {
-                parts.push(format!("[{role_label}]\n{text}"));
+
+            let mut section_parts: Vec<String> = Vec::new();
+
+            // Extract text and images from content blocks.
+            match &msg.content {
+                openfang_types::message::MessageContent::Text(s) => {
+                    if !s.is_empty() {
+                        section_parts.push(s.clone());
+                    }
+                }
+                openfang_types::message::MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        match block {
+                            openfang_types::message::ContentBlock::Text { text, .. } => {
+                                if !text.is_empty() {
+                                    section_parts.push(text.clone());
+                                }
+                            }
+                            openfang_types::message::ContentBlock::Image { media_type, data } => {
+                                // Save base64 image to a temp file so the CLI can read it.
+                                use base64::Engine;
+                                let ext = if media_type.contains("png") {
+                                    "png"
+                                } else if media_type.contains("gif") {
+                                    "gif"
+                                } else if media_type.contains("webp") {
+                                    "webp"
+                                } else {
+                                    "jpg"
+                                };
+                                let tmp_path = format!(
+                                    "/tmp/openfang-img-{}.{}",
+                                    uuid::Uuid::new_v4().as_simple(),
+                                    ext
+                                );
+                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                                    if std::fs::write(&tmp_path, &bytes).is_ok() {
+                                        section_parts.push(format!(
+                                            "[User sent an image. Read it with your Read tool at: {tmp_path}]"
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if !section_parts.is_empty() {
+                parts.push(format!("[{role_label}]\n{}", section_parts.join("\n")));
             }
         }
 
