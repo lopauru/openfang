@@ -318,7 +318,7 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg("json");
 
         if let Some(ref sys) = request.system {
-            cmd.arg("--system-prompt").arg(sys);
+            cmd.arg("--append-system-prompt").arg(sys);
         }
 
         if self.skip_permissions {
@@ -514,7 +514,7 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg("--verbose");
 
         if let Some(ref sys) = request.system {
-            cmd.arg("--system-prompt").arg(sys);
+            cmd.arg("--append-system-prompt").arg(sys);
         }
 
         if self.skip_permissions {

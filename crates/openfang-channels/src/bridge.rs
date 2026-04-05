@@ -961,22 +961,6 @@ async fn dispatch_message(
     // (which expire typing after ~5s) keep showing it during long LLM calls.
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
-    // Prepend sender context so the agent knows who is speaking.
-    // In group spaces this is essential for multi-user conversations.
-    let sender_name = &message.sender.display_name;
-    let sender_email = message
-        .metadata
-        .get("sender_email")
-        .and_then(|v| v.as_str());
-    let prefixed_text = if !sender_name.is_empty() {
-        match sender_email {
-            Some(email) => format!("[From: {sender_name} <{email}>] {text}"),
-            None => format!("[From: {sender_name}] {text}"),
-        }
-    } else {
-        text.clone()
-    };
-
     // Build a channel scope for per-channel sessions.
     // Format: "channel_type:platform_id" (e.g. "discord:123456", "whatsapp:+598...")
     let channel_scope = {
@@ -996,6 +980,27 @@ async fn dispatch_message(
             &message.sender.platform_id
         };
         format!("{ct}:{scope_id}")
+    };
+
+    // Prepend sender context so the agent knows who is speaking.
+    // Include channel scope so the agent knows which channel it's in.
+    let sender_name = &message.sender.display_name;
+    let sender_email = message
+        .metadata
+        .get("sender_email")
+        .and_then(|v| v.as_str());
+    let channel_tag = if message.is_group {
+        format!(" | channel={channel_scope}")
+    } else {
+        format!(" | dm={channel_scope}")
+    };
+    let prefixed_text = if !sender_name.is_empty() {
+        match sender_email {
+            Some(email) => format!("[From: {sender_name} <{email}>{channel_tag}] {text}"),
+            None => format!("[From: {sender_name}{channel_tag}] {text}"),
+        }
+    } else {
+        text.clone()
     };
 
     // Send to agent using a channel-scoped session
