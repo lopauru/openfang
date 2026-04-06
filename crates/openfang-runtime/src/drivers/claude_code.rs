@@ -52,6 +52,14 @@ const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD"];
 /// Default subprocess timeout in seconds (5 minutes).
 const DEFAULT_MESSAGE_TIMEOUT_SECS: u64 = 300;
 
+/// Process-wide storage for CLI session IDs (conversation_id → cli_session_id).
+/// Must be static because the kernel recreates drivers on each call.
+static CLI_SESSIONS: std::sync::OnceLock<DashMap<String, String>> = std::sync::OnceLock::new();
+
+fn cli_sessions() -> &'static DashMap<String, String> {
+    CLI_SESSIONS.get_or_init(|| DashMap::new())
+}
+
 /// LLM driver that delegates to the Claude Code CLI.
 pub struct ClaudeCodeDriver {
     cli_path: String,
@@ -61,6 +69,9 @@ pub struct ClaudeCodeDriver {
     active_pids: Arc<DashMap<String, u32>>,
     /// Message timeout in seconds. CLI subprocesses that exceed this are killed.
     message_timeout_secs: u64,
+    /// Maps conversation_id → CLI session_id for --resume support.
+    /// Each channel/DM gets its own persistent CLI session.
+    cli_sessions: Arc<DashMap<String, String>>,
 }
 
 impl ClaudeCodeDriver {
@@ -85,6 +96,7 @@ impl ClaudeCodeDriver {
             skip_permissions,
             active_pids: Arc::new(DashMap::new()),
             message_timeout_secs: DEFAULT_MESSAGE_TIMEOUT_SECS,
+            cli_sessions: Arc::new(DashMap::new()),
         }
     }
 
@@ -254,6 +266,9 @@ struct ClaudeJsonOutput {
     #[serde(default)]
     #[allow(dead_code)]
     cost_usd: Option<f64>,
+    /// CLI session ID for --resume support.
+    #[serde(default, alias = "sessionId")]
+    session_id: Option<String>,
 }
 
 /// Usage stats from Claude CLI JSON output.
@@ -303,13 +318,55 @@ struct ClaudeStreamEvent {
     message: Option<ClaudeAssistantMessage>,
     #[serde(default)]
     usage: Option<ClaudeUsage>,
+    /// CLI session ID for --resume support.
+    #[serde(default, alias = "sessionId")]
+    session_id: Option<String>,
 }
 
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
+
+        // Check if we can resume a previous CLI session for this conversation.
+        let cli_session_id = request.conversation_id.as_ref()
+            .and_then(|cid| {
+                let found = cli_sessions().get(cid).map(|v| v.clone());
+                debug!(
+                    conversation_id = %cid,
+                    has_stored_session = found.is_some(),
+                    total_sessions = cli_sessions().len(),
+                    "Resume lookup"
+                );
+                found
+            });
+        let is_resume = cli_session_id.is_some();
+
+        // With --resume: only send the last user message (CLI has the rest)
+        // Without --resume: send full history as before
+        let prompt = if is_resume {
+            // Extract only the last user message, including image handling
+            if let Some(last_msg) = request.messages.iter().rev()
+                .find(|m| m.role == openfang_types::message::Role::User)
+            {
+                // Build prompt from just this one message to handle images correctly
+                let single_request = CompletionRequest {
+                    model: request.model.clone(),
+                    messages: vec![last_msg.clone()],
+                    tools: vec![],
+                    max_tokens: 0,
+                    temperature: 0.0,
+                    system: None,
+                    thinking: None,
+                    conversation_id: None,
+                };
+                Self::build_prompt(&single_request)
+            } else {
+                String::new()
+            }
+        } else {
+            Self::build_prompt(&request)
+        };
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
         cmd.arg("-p")
@@ -317,8 +374,17 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg("--output-format")
             .arg("json");
 
-        if let Some(ref sys) = request.system {
-            cmd.arg("--append-system-prompt").arg(sys);
+        // Resume previous CLI session if available
+        if let Some(ref sid) = cli_session_id {
+            cmd.arg("--resume").arg(sid);
+            debug!(session_id = %sid, "Resuming Claude Code CLI session");
+        }
+
+        // Only send system prompt on first message (no resume) to avoid repetition
+        if !is_resume {
+            if let Some(ref sys) = request.system {
+                cmd.arg("--append-system-prompt").arg(sys);
+            }
         }
 
         if self.skip_permissions {
@@ -425,6 +491,17 @@ impl LlmDriver for ClaudeCodeDriver {
             };
             let code = status.code().unwrap_or(1);
 
+            // If this was a --resume attempt that failed, clear the session and
+            // retry WITHOUT resume so the user's message isn't lost.
+            if is_resume {
+                if let Some(ref cid) = request.conversation_id {
+                    warn!(conversation_id = %cid, exit_code = code, "Resume failed, retrying without resume");
+                    cli_sessions().remove(cid);
+                }
+                // Retry: call complete() again — this time is_resume will be false
+                return self.complete(request).await;
+            }
+
             warn!(
                 exit_code = code,
                 model = %pid_label,
@@ -462,6 +539,12 @@ impl LlmDriver for ClaudeCodeDriver {
 
         // Try JSON parse first
         if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
+            // Store CLI session_id for future --resume calls
+            if let (Some(ref cid), Some(ref sid)) = (&request.conversation_id, &parsed.session_id) {
+                debug!(conversation_id = %cid, cli_session_id = %sid, "Stored CLI session for resume");
+                cli_sessions().insert(cid.clone(), sid.clone());
+            }
+
             let text = parsed
                 .result
                 .or(parsed.content)
@@ -503,7 +586,33 @@ impl LlmDriver for ClaudeCodeDriver {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<CompletionResponse, LlmError> {
-        let prompt = Self::build_prompt(&request);
+        // Check for resume (same logic as complete())
+        let cli_session_id = request.conversation_id.as_ref()
+            .and_then(|cid| cli_sessions().get(cid).map(|v| v.clone()));
+        let is_resume = cli_session_id.is_some();
+
+        let prompt = if is_resume {
+            if let Some(last_msg) = request.messages.iter().rev()
+                .find(|m| m.role == openfang_types::message::Role::User)
+            {
+                let single_request = CompletionRequest {
+                    model: request.model.clone(),
+                    messages: vec![last_msg.clone()],
+                    tools: vec![],
+                    max_tokens: 0,
+                    temperature: 0.0,
+                    system: None,
+                    thinking: None,
+                    conversation_id: None,
+                };
+                Self::build_prompt(&single_request)
+            } else {
+                String::new()
+            }
+        } else {
+            Self::build_prompt(&request)
+        };
+
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
@@ -513,8 +622,14 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg("stream-json")
             .arg("--verbose");
 
-        if let Some(ref sys) = request.system {
-            cmd.arg("--append-system-prompt").arg(sys);
+        if let Some(ref sid) = cli_session_id {
+            cmd.arg("--resume").arg(sid);
+        }
+
+        if !is_resume {
+            if let Some(ref sys) = request.system {
+                cmd.arg("--append-system-prompt").arg(sys);
+            }
         }
 
         if self.skip_permissions {
@@ -565,6 +680,8 @@ impl LlmDriver for ClaudeCodeDriver {
             input_tokens: 0,
             output_tokens: 0,
         };
+
+        let conv_id = request.conversation_id.clone();
 
         let timeout_duration = std::time::Duration::from_secs(self.message_timeout_secs);
         let stream_result = tokio::time::timeout(timeout_duration, async {
@@ -617,6 +734,11 @@ impl LlmDriver for ClaudeCodeDriver {
                                         input_tokens: usage.input_tokens,
                                         output_tokens: usage.output_tokens,
                                     };
+                                }
+                                // Store CLI session_id for resume
+                                if let (Some(ref cid), Some(ref sid)) = (&conv_id, &event.session_id) {
+                                    debug!(conversation_id = %cid, cli_session_id = %sid, "Stored CLI session for resume (stream)");
+                                    cli_sessions().insert(cid.clone(), sid.clone());
                                 }
                             }
                             _ => {
@@ -766,6 +888,7 @@ mod tests {
             temperature: 0.7,
             system: Some("You are helpful.".to_string()),
             thinking: None,
+            conversation_id: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);

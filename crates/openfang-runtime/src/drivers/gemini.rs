@@ -1243,6 +1243,7 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            conversation_id: None,
         };
 
         let tools = convert_tools(&request);
@@ -1261,6 +1262,7 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            conversation_id: None,
         };
 
         let tools = convert_tools(&request);

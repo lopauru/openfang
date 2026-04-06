@@ -65,6 +65,10 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
+    /// Conversation identifier for session resumption (e.g. channel_scope).
+    /// Drivers that support session persistence (like claude-code) use this
+    /// to resume previous CLI sessions instead of starting fresh.
+    pub conversation_id: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -305,6 +309,7 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            conversation_id: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

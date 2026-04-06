@@ -7619,6 +7619,7 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                conversation_id: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {
